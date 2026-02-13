@@ -37,14 +37,14 @@ function stripHtml(html) {
 }
 
 /**
- * Get the message object from Nylas webhook payload (supports different shapes).
- * If payload only has id + grant_id, returns null (caller can fetch via API).
+ * Get the message object from Nylas webhook payload.
+ * Nylas v3 sends data.application_id and data.object (the message); older or alternate shapes put message fields on data directly.
  */
 function getMessageData(payload) {
   const data = payload.data;
   if (!data) return null;
-  if (data.object === "message" && data.subject != null) return data;
-  if (data.subject != null || data.body != null || data.snippet != null) return data;
+  const msg = data.object && typeof data.object === "object" ? data.object : data;
+  if (msg.subject != null || msg.body != null || msg.snippet != null || msg.id) return msg;
   return null;
 }
 
@@ -249,9 +249,14 @@ app.all("/webhook", async (req, res) => {
   const rawData = payload.data;
 
   if (eventType === "message.created" || eventType === "message.updated") {
-    if (!data && rawData && rawData.id && rawData.grant_id) {
+    const msgRef = rawData?.object && typeof rawData.object === "object" ? rawData.object : rawData;
+    if (!data && msgRef?.id && msgRef?.grant_id) {
       console.log("Payload has id/grant_id but no body; fetching message from Nylas API.");
-      data = await fetchNylasMessage(rawData.id, rawData.grant_id);
+      data = await fetchNylasMessage(msgRef.id, msgRef.grant_id);
+    }
+    if (data && (data.body == null || data.body === "") && data.id && data.grant_id) {
+      console.log("Message has no body; fetching full message from Nylas API.");
+      data = await fetchNylasMessage(data.id, data.grant_id) || data;
     }
     if (data) {
       const subjectLen = (data.subject || "").length;
