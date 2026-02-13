@@ -1,0 +1,11 @@
+# Optional: deploy from Render Dashboard by connecting repo and using these defaults.
+# Or create the Web Service manually and leave this file as reference.
+services:
+  - type: web
+    name: nylas-webhook
+    runtime: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: WEBHOOK_SECRET
+        sync: false  # set in Dashboard after creating webhook in Nylas
