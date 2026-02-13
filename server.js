@@ -1,9 +1,9 @@
 /**
  * Nylas webhook server for Render.io
  *
- * Verification: Nylas sends GET ?challenge=xxx — we must respond with 200 and
- * the exact challenge string in the body (no quotes, no chunked encoding).
- * POST: verify X-Nylas-Signature and respond 200 OK.
+ * - GET ?challenge=xxx → return challenge (verification).
+ * - POST: verify signature, on message.created parse forwarded email for
+ *   company name + domain and create an order in SaleSys.
  */
 
 const express = require("express");
@@ -18,21 +18,191 @@ app.use(
   express.raw({ type: "application/json", limit: "2mb" })
 );
 
-// Health check (Render and browsers)
+// Health check
 app.get("/", (req, res) => {
   res.send("Nylas webhook endpoint. Use GET /webhook?challenge=... for verification.");
 });
 
 /**
- * Nylas webhook endpoint.
- * GET: verification challenge — return challenge as plain text, 200 OK.
- * POST: notification — verify signature, respond 200 OK.
+ * Strip HTML tags and decode common entities for regex over plain text.
  */
-app.all("/webhook", (req, res) => {
+function stripHtml(html) {
+  if (!html || typeof html !== "string") return "";
+  return html
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&#160;/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * Get the message object from Nylas webhook payload (supports different shapes).
+ * If payload only has id + grant_id, returns null (caller can fetch via API).
+ */
+function getMessageData(payload) {
+  const data = payload.data;
+  if (!data) return null;
+  if (data.object === "message" && data.subject != null) return data;
+  if (data.subject != null || data.body != null || data.snippet != null) return data;
+  return null;
+}
+
+/**
+ * Fetch full message from Nylas API when webhook only sent id/grant_id.
+ */
+async function fetchNylasMessage(messageId, grantId) {
+  const apiKey = process.env.NYLAS_API_KEY;
+  const baseUrl = process.env.NYLAS_API_URI || "https://api.us.nylas.com";
+  if (!apiKey || !messageId || !grantId) return null;
+  try {
+    const url = `${baseUrl.replace(/\/$/, "")}/v3/grants/${grantId}/messages/${messageId}`;
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (e) {
+    console.error("Nylas fetch error:", e.message);
+    return null;
+  }
+}
+
+/**
+ * Parse forwarded booking email (Bright / Loop style) for company name and domain.
+ * - Company: from subject "Möte med X" or body "Företag/Person" line.
+ * - Domain + contact email: from first external mailto in body (skip forwarder domains).
+ */
+function parseForwardedEmail(data) {
+  const subject = (data.subject || "").trim();
+  const body = data.body || "";
+  const snippet = data.snippet || "";
+  const bodyText = stripHtml(body);
+  const searchText = bodyText || snippet;
+  const result = { companyName: null, domain: null, contactEmail: null };
+
+  // Company from subject: "Fwd: VB: Möte med Medhelp Care Aktiebolag (publ)" – capture everything after "Möte med"
+  const subjectMatch = subject.match(/Möte med\s+(.+)/i) || subject.match(/meeting with\s+(.+)/i);
+  if (subjectMatch) result.companyName = subjectMatch[1].trim();
+
+  // Company from body/snippet: "Företag/Person" then value
+  if (!result.companyName && searchText) {
+    const foretagMatch = searchText.match(/Företag\/Person\s+([A-Za-zÅÄÖåäö0-9\s\-.,()&]+?)(?=\s+Start\s|\s+Plats|$)/i)
+      || body.match(/Företag\/Person<\/strong>[^<]*(?:<[^>]+>)*([A-Za-zÅÄÖåäö0-9\s\-.,()&]+)/i);
+    if (foretagMatch) result.companyName = (foretagMatch[1] || "").trim();
+  }
+
+  // Contact email and domain from mailto: in body (prefer customer email, not forwarder)
+  const skipDomains = ["salesys.se", "brightsales.se", "get-loop.co", "insights.agana.ai", "gmail.com", "outlook.com", "hotmail.com"];
+  const mailtoRegex = /mailto:([a-zA-Z0-9._%+-]+@([a-zA-Z0-9.-]+\.[a-zA-Z]{2,}))/gi;
+  let match;
+  while ((match = mailtoRegex.exec(body)) !== null) {
+    const email = match[1];
+    const domain = (match[2] || "").toLowerCase();
+    if (domain && !skipDomains.some((d) => domain.includes(d))) {
+      result.contactEmail = email;
+      result.domain = domain;
+      break;
+    }
+  }
+  if (!result.contactEmail && snippet) {
+    const emailInSnippet = /([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/g;
+    let em;
+    while ((em = emailInSnippet.exec(snippet)) !== null) {
+      const domain = (em[1].split("@")[1] || "").toLowerCase();
+      if (domain && !skipDomains.some((d) => domain.includes(d))) {
+        result.contactEmail = em[1];
+        result.domain = domain;
+        break;
+      }
+    }
+  }
+
+  if (result.contactEmail && !result.domain)
+    result.domain = (result.contactEmail.split("@")[1] || "").toLowerCase();
+
+  return result;
+}
+
+/**
+ * Create order in SaleSys with domain, company name, and contact email.
+ */
+async function createSaleSysOrder(parsed) {
+  const bearer = process.env.SALESYS_BEARER;
+  const userId = process.env.SALESYS_USER_ID;
+  const projectId = process.env.SALESYS_PROJECT_ID;
+  const tagIds = process.env.SALESYS_TAG_IDS ? JSON.parse(process.env.SALESYS_TAG_IDS) : ["657856602a93b41dba43da0d"];
+  const fieldIdDomain = process.env.SALESYS_FIELD_ID_DOMAIN || "698f51a709154bfcc1f0ba02";
+  const fieldIdCompany = process.env.SALESYS_FIELD_ID_COMPANY || "65784e2c2a93b41dba43d3cb";
+  const fieldIdEmail = process.env.SALESYS_FIELD_ID_EMAIL || "698f542309154bfcc1f0bb71";
+
+  if (!bearer || !userId || !projectId) {
+    console.warn("SaleSys env not configured (SALESYS_BEARER, SALESYS_USER_ID, SALESYS_PROJECT_ID); skipping order.");
+    return null;
+  }
+
+  if (!parsed.domain && !parsed.companyName) {
+    console.warn("No domain or company name parsed; skipping SaleSys order.");
+    return null;
+  }
+
+  const now = new Date();
+  const businessDate = new Date(now);
+  businessDate.setDate(businessDate.getDate() + 4);
+
+  const fields = [
+    { fieldId: fieldIdDomain, value: parsed.domain || "", changedByUser: true },
+    { fieldId: fieldIdCompany, value: parsed.companyName || "", changedByUser: true },
+    { fieldId: fieldIdEmail, value: parsed.contactEmail || "", changedByUser: true },
+  ];
+  const fieldValues = {
+    [fieldIdDomain]: parsed.domain || "",
+    [fieldIdCompany]: parsed.companyName || "",
+    [fieldIdEmail]: parsed.contactEmail || "",
+  };
+
+  const body = {
+    tagIds,
+    date: now.toISOString(),
+    businessDate: businessDate.toISOString(),
+    userId,
+    products: [],
+    fields,
+    comments: [],
+    files: [],
+    externalEvents: [],
+    isTest: false,
+    projectId,
+    calendarEventIds: [],
+    calendarEvents: null,
+    fieldValues,
+    autoFill: false,
+  };
+
+  const res = await fetch("https://app.salesys.se/api/orders/orders-v2", {
+    method: "POST",
+    headers: {
+      accept: "*/*",
+      "content-type": "application/json",
+      authorization: `Bearer ${bearer}`,
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    console.error("SaleSys order failed:", res.status, text);
+    return null;
+  }
+  const data = await res.json();
+  console.log("SaleSys order created:", data.id || data);
+  return data;
+}
+
+app.all("/webhook", async (req, res) => {
   if (req.method === "GET") {
     const challenge = req.query.challenge;
     if (challenge != null && String(challenge).length > 0) {
-      // Required: 200 OK with exact challenge in body (no quotes, no chunked)
       res.status(200).set("Content-Type", "text/plain").send(String(challenge));
       return;
     }
@@ -45,7 +215,7 @@ app.all("/webhook", (req, res) => {
     return;
   }
 
-  const rawBody = req.body; // Buffer from express.raw()
+  const rawBody = req.body;
   const signature = req.headers["x-nylas-signature"] || req.headers["X-Nylas-Signature"];
   const webhookSecret = process.env.WEBHOOK_SECRET;
 
@@ -54,24 +224,47 @@ app.all("/webhook", (req, res) => {
     res.status(500).send("Server misconfiguration");
     return;
   }
-
   if (!signature) {
     res.status(401).send("Missing signature");
     return;
   }
-
-  const isValid = verifySignature(rawBody, webhookSecret, signature);
-  if (!isValid) {
+  if (!verifySignature(rawBody, webhookSecret, signature)) {
     res.status(403).send("Invalid signature");
     return;
   }
 
+  let payload;
   try {
-    const payload = JSON.parse(rawBody.toString("utf8"));
-    console.log("Webhook:", payload.type || payload);
-    // Process payload here (e.g. grant.created, message.created, etc.)
+    payload = JSON.parse(rawBody.toString("utf8"));
   } catch (e) {
     console.error("Webhook payload parse error:", e.message);
+    res.status(200).send("OK");
+    return;
+  }
+
+  const eventType = payload.type || payload.event;
+  console.log("Webhook:", eventType);
+
+  let data = getMessageData(payload);
+  const rawData = payload.data;
+
+  if (eventType === "message.created" || eventType === "message.updated") {
+    if (!data && rawData && rawData.id && rawData.grant_id) {
+      console.log("Payload has id/grant_id but no body; fetching message from Nylas API.");
+      data = await fetchNylasMessage(rawData.id, rawData.grant_id);
+    }
+    if (data) {
+      const subjectLen = (data.subject || "").length;
+      const bodyLen = (data.body || "").length;
+      const snippetLen = (data.snippet || "").length;
+      console.log("Payload data keys:", Object.keys(data).join(", "), "| subject:", subjectLen, "body:", bodyLen, "snippet:", snippetLen);
+      if (subjectLen) console.log("Subject:", (data.subject || "").slice(0, 120));
+      const parsed = parseForwardedEmail(data);
+      console.log("Parsed:", parsed);
+      createSaleSysOrder(parsed).catch((err) => console.error("SaleSys error:", err));
+    } else {
+      console.log("No message data; payload.data keys:", rawData ? Object.keys(rawData).join(", ") : "none");
+    }
   }
 
   res.status(200).send("OK");
