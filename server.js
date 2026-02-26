@@ -69,72 +69,84 @@ async function fetchNylasMessage(messageId, grantId) {
 }
 
 /**
- * Parse forwarded booking email (Bright / Loop style) for company name and domain.
- * - Company: from subject "Möte med X" or body "Företag/Person" line.
- * - Domain + contact email: from first external mailto in body (skip forwarder domains).
+ * Normalize domain for fuzzy matching (lowercase, no www, trim).
+ */
+function normalizeDomain(domain) {
+  if (!domain || typeof domain !== "string") return "";
+  return domain.toLowerCase().replace(/^www\./, "").trim();
+}
+
+/**
+ * Extract the next text element after the first string containing "företag" (case insensitive) in HTML or plain text.
+ */
+function getCompanyNameAfterForetag(text) {
+  if (!text || typeof text !== "string") return null;
+  const idx = text.search(/företag/i);
+  if (idx === -1) return null;
+  const m = text.slice(idx).match(/företag/i);
+  const after = text.slice(idx + (m ? m[0].length : 0));
+  const plain = stripHtml(after).replace(/\s+/g, " ").trim();
+  const nameMatch = plain.match(/^([A-Za-zÅÄÖåäö0-9\s\-.,()&]+?)(?=\s+Start\s|\s+Plats\s|$)/i) || plain.match(/^([A-Za-zÅÄÖåäö0-9\s\-.,()&]+)/);
+  return nameMatch ? nameMatch[1].trim() || null : null;
+}
+
+/**
+ * Extract the first email address appearing after the keyword "Resurs" (case insensitive).
+ */
+function getEmailAfterResurs(text) {
+  if (!text || typeof text !== "string") return null;
+  const plain = stripHtml(text);
+  const m = plain.match(/resurs\b[\s\S]*?([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/i);
+  return m ? m[1] : null;
+}
+
+/**
+ * Extract the first URL-like string appearing after the keyword "Url" (case insensitive).
+ */
+function getUrlAfterUrl(text) {
+  if (!text || typeof text !== "string") return null;
+  const plain = stripHtml(text);
+  const m = plain.match(/\burl\b[\s\S]*?((?:https?:\/\/)?(?:www\.)?[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}(?:\/\S*)?)/i);
+  return m ? m[1] : null;
+}
+
+/**
+ * Parse forwarded booking email (Bright / Loop style) for company name, domain, and salesperson email.
+ * - Company (Företag): next text element after first string containing "företag" (case insensitive).
+ * - Salesperson email (Resurs): next email address after the word "Resurs".
+ * - Domain (Url): next URL-like string after the word "Url".
  */
 function parseForwardedEmail(data) {
-  const subject = (data.subject || "").trim();
   const body = data.body || "";
   const snippet = data.snippet || "";
-  const bodyText = stripHtml(body);
-  const searchText = bodyText || snippet;
-  const result = { companyName: null, domain: null, contactEmail: null };
+  const result = { companyName: null, domain: null, salespersonEmail: null };
 
-  // Company from subject: "Fwd: VB: Möte med Medhelp Care Aktiebolag (publ)" – capture everything after "Möte med"
-  const subjectMatch = subject.match(/Möte med\s+(.+)/i) || subject.match(/meeting with\s+(.+)/i);
-  if (subjectMatch) result.companyName = subjectMatch[1].trim();
+  // Företag: next text after first "företag" (case insensitive) in body or snippet
+  result.companyName = getCompanyNameAfterForetag(body) || getCompanyNameAfterForetag(snippet);
 
-  // Company from body/snippet: "Företag/Person" then value
-  if (!result.companyName && searchText) {
-    const foretagMatch = searchText.match(/Företag\/Person\s+([A-Za-zÅÄÖåäö0-9\s\-.,()&]+?)(?=\s+Start\s|\s+Plats|$)/i)
-      || body.match(/Företag\/Person<\/strong>[^<]*(?:<[^>]+>)*([A-Za-zÅÄÖåäö0-9\s\-.,()&]+)/i);
-    if (foretagMatch) result.companyName = (foretagMatch[1] || "").trim();
+  // Resurs: next email address after the word "Resurs"
+  result.salespersonEmail = getEmailAfterResurs(body) || getEmailAfterResurs(snippet);
+
+  // Url: next URL-like string after the word "Url" → extract domain
+  const url = getUrlAfterUrl(body) || getUrlAfterUrl(snippet);
+  if (url) {
+    result.domain = normalizeDomain(url.replace(/^https?:\/\//, "").replace(/\/.*$/, ""));
   }
-
-  // Contact email and domain from mailto: in body (prefer customer email, not forwarder)
-  const skipDomains = ["salesys.se", "brightsales.se", "get-loop.co", "insights.agana.ai", "gmail.com", "outlook.com", "hotmail.com"];
-  const mailtoRegex = /mailto:([a-zA-Z0-9._%+-]+@([a-zA-Z0-9.-]+\.[a-zA-Z]{2,}))/gi;
-  let match;
-  while ((match = mailtoRegex.exec(body)) !== null) {
-    const email = match[1];
-    const domain = (match[2] || "").toLowerCase();
-    if (domain && !skipDomains.some((d) => domain.includes(d))) {
-      result.contactEmail = email;
-      result.domain = domain;
-      break;
-    }
-  }
-  if (!result.contactEmail && snippet) {
-    const emailInSnippet = /([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/g;
-    let em;
-    while ((em = emailInSnippet.exec(snippet)) !== null) {
-      const domain = (em[1].split("@")[1] || "").toLowerCase();
-      if (domain && !skipDomains.some((d) => domain.includes(d))) {
-        result.contactEmail = em[1];
-        result.domain = domain;
-        break;
-      }
-    }
-  }
-
-  if (result.contactEmail && !result.domain)
-    result.domain = (result.contactEmail.split("@")[1] || "").toLowerCase();
 
   return result;
 }
 
 /**
- * Create order in SaleSys with domain, company name, and contact email.
+ * Create order in SaleSys with Domän, Företag, and Säljare e-post.
  */
 async function createSaleSysOrder(parsed) {
   const bearer = process.env.SALESYS_BEARER;
   const userId = process.env.SALESYS_USER_ID;
   const projectId = process.env.SALESYS_PROJECT_ID;
-  const tagIds = process.env.SALESYS_TAG_IDS ? JSON.parse(process.env.SALESYS_TAG_IDS) : ["657856602a93b41dba43da0d"];
-  const fieldIdDomain = process.env.SALESYS_FIELD_ID_DOMAIN || "698f51a709154bfcc1f0ba02";
-  const fieldIdCompany = process.env.SALESYS_FIELD_ID_COMPANY || "65784e2c2a93b41dba43d3cb";
-  const fieldIdEmail = process.env.SALESYS_FIELD_ID_EMAIL || "698f542309154bfcc1f0bb71";
+  const tagIds = process.env.SALESYS_TAG_IDS ? JSON.parse(process.env.SALESYS_TAG_IDS) : ["698f547309154bfcc1f0bb87"];
+  const fieldIdDomain = process.env.SALESYS_FIELD_ID_DOMAIN || "698f51a709154bfcc1f0ba02";       // Domän
+  const fieldIdCompany = process.env.SALESYS_FIELD_ID_COMPANY || "65784e2c2a93b41dba43d3cb";   // Företag
+  const fieldIdSalespersonEmail = process.env.SALESYS_FIELD_ID_SALESPERSON_EMAIL || "698f542309154bfcc1f0bb71"; // Säljare e-post
 
   if (!bearer || !userId || !projectId) {
     console.warn("SaleSys env not configured (SALESYS_BEARER, SALESYS_USER_ID, SALESYS_PROJECT_ID); skipping order.");
@@ -153,12 +165,12 @@ async function createSaleSysOrder(parsed) {
   const fields = [
     { fieldId: fieldIdDomain, value: parsed.domain || "", changedByUser: true },
     { fieldId: fieldIdCompany, value: parsed.companyName || "", changedByUser: true },
-    { fieldId: fieldIdEmail, value: parsed.contactEmail || "", changedByUser: true },
+    { fieldId: fieldIdSalespersonEmail, value: parsed.salespersonEmail || "", changedByUser: true },
   ];
   const fieldValues = {
     [fieldIdDomain]: parsed.domain || "",
     [fieldIdCompany]: parsed.companyName || "",
-    [fieldIdEmail]: parsed.contactEmail || "",
+    [fieldIdSalespersonEmail]: parsed.salespersonEmail || "",
   };
 
   const body = {
