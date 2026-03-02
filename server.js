@@ -83,7 +83,7 @@ function getCompanyNameAfterForetag(text) {
   if (!text || typeof text !== "string") return null;
   const idx = text.search(/företag/i);
   if (idx === -1) return null;
-  const m = text.slice(idx).match(/företag/i);
+  const m = text.slice(idx).match(/företag[\/\w]*/i);
   const after = text.slice(idx + (m ? m[0].length : 0));
   const plain = stripHtml(after).replace(/\s+/g, " ").trim();
   const nameMatch = plain.match(/^([A-Za-zÅÄÖåäö0-9\s\-.,()&]+?)(?=\s+Start\s|\s+Plats\s|$)/i) || plain.match(/^([A-Za-zÅÄÖåäö0-9\s\-.,()&]+)/);
